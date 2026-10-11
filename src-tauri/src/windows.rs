@@ -1,8 +1,10 @@
 use serde::Serialize;
+use std::time::Instant;
 use tauri::window::Monitor;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize};
 
 use crate::hit_regions::HitProfile;
+use crate::util::MutexExt;
 
 pub const OBJ_SCALE_W: f64 = 1.9;
 pub const OBJ_SCALE_H: f64 = 1.3;
@@ -148,15 +150,17 @@ pub fn pet_scale_factor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Work area of the monitor (excludes taskbar), in physical pixels.
+/// Snap/clamp/peek logic must treat the usable region as "the screen" —
+/// full-monitor bounds would let the pet tuck itself under a side taskbar.
 pub fn monitor_area(monitor: &Monitor) -> MonitorArea {
-    let pos = monitor.position();
-    let size = monitor.size();
+    let work = monitor.work_area();
     MonitorArea {
         key: monitor_key(monitor),
-        x: pos.x,
-        y: pos.y,
-        width: size.width,
-        height: size.height,
+        x: work.position.x,
+        y: work.position.y,
+        width: work.size.width,
+        height: work.size.height,
     }
 }
 
@@ -185,15 +189,53 @@ pub fn monitor_for_bounds(app: &AppHandle, bounds: &WindowBounds) -> Option<Moni
     best_monitor_for_bounds(bounds, &monitors).cloned()
 }
 
+/// TTL for the monitor-geometry cache. Drag and the 50 ms tick loop query
+/// monitors up to ~60×/s; each query is a Win32 enumeration round-trip.
+const MONITOR_CACHE_TTL_MS: u64 = 500;
+
+/// Managed state caching monitor geometry. Screens rarely change; a short TTL
+/// keeps data fresh without per-call enumeration.
+#[derive(Default)]
+pub struct MonitorCache(std::sync::Mutex<Option<(Instant, Vec<MonitorArea>)>>);
+
+impl MonitorCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn clear(&self) {
+        *self.0.lock_or_recover() = None;
+    }
+}
+
 pub fn available_monitor_areas(app: &AppHandle) -> Option<Vec<MonitorArea>> {
     let pet = app.get_webview_window("pet")?;
-    let monitors = pet.available_monitors().ok()?;
-    Some(
-        monitors
-            .into_iter()
-            .map(|monitor| monitor_area(&monitor))
-            .collect(),
-    )
+    let Some(cache) = app.try_state::<MonitorCache>() else {
+        // Cache not managed (e.g. unit tests) — enumerate directly.
+        return Some(
+            pet.available_monitors()
+                .ok()?
+                .into_iter()
+                .map(|monitor| monitor_area(&monitor))
+                .collect(),
+        );
+    };
+    let now = Instant::now();
+    {
+        let guard = cache.0.lock_or_recover();
+        if let Some((ts, areas)) = guard.as_ref() {
+            if now.duration_since(*ts).as_millis() as u64 <= MONITOR_CACHE_TTL_MS {
+                return Some(areas.clone());
+            }
+        }
+    }
+    let areas: Vec<MonitorArea> = pet
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .map(|monitor| monitor_area(&monitor))
+        .collect();
+    *cache.0.lock_or_recover() = Some((now, areas.clone()));
+    Some(areas)
 }
 
 pub fn current_monitor_for_pet(app: &AppHandle) -> Option<MonitorArea> {
@@ -428,8 +470,19 @@ pub fn sync_hit_window(
         layout = collapse_hit_layout(layout);
     }
 
-    let _ = hit_win.set_position(PhysicalPosition::new(layout.window_x, layout.window_y));
-    let _ = hit_win.set_size(PhysicalSize::new(layout.width, layout.height));
+    // Skip unchanged geometry: set_size triggers WM_SIZE → WebView2 relayout,
+    // which used to fire on every pointer move during drags. A read is far
+    // cheaper than a redundant set.
+    let target_pos = PhysicalPosition::new(layout.window_x, layout.window_y);
+    let target_size = PhysicalSize::new(layout.width, layout.height);
+    let cur_pos = hit_win.outer_position().ok();
+    if cur_pos != Some(target_pos) {
+        let _ = hit_win.set_position(target_pos);
+    }
+    let cur_size = hit_win.outer_size().ok();
+    if cur_size != Some(target_size) {
+        let _ = hit_win.set_size(target_size);
+    }
     Some(layout)
 }
 

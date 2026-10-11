@@ -71,6 +71,19 @@
     return DRAG_THRESHOLD_PHYSICAL_PX / (window.devicePixelRatio || 1);
   }
 
+  // Coalesce pointermove → at most one drag_move IPC per animation frame.
+  // High-polling mice emit hundreds of moves/sec; one IPC round-trip each
+  // built a queue that made the window trail the cursor (rubber-banding).
+  let pendingX = 0;
+  let pendingY = 0;
+  let rafPending = false;
+
+  function flushDragMove() {
+    rafPending = false;
+    if (!pointerActive || positionLocked) return;
+    invoke('drag_move', { x: pendingX, y: pendingY });
+  }
+
   function onPointerMove(e: PointerEvent) {
     if (!pointerActive) return;
     if (activePointerId !== null && e.pointerId !== activePointerId) return;
@@ -90,10 +103,15 @@
       const dy = e.screenY - startY;
       if (Math.sqrt(dx * dx + dy * dy) >= dragDistanceThresholdLogicalPx()) isDragging = true;
     }
-    invoke('drag_move', { x: e.screenX, y: e.screenY });
+    pendingX = e.screenX;
+    pendingY = e.screenY;
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(flushDragMove);
+    }
   }
 
-  function onPointerUp(e: PointerEvent) {
+  function endPointer(e: PointerEvent) {
     if (!pointerActive) return;
     if (activePointerId !== null && e.pointerId !== activePointerId) return;
     (e.target as Element)?.releasePointerCapture(e.pointerId);
@@ -102,20 +120,22 @@
     snapSide = null;
     promptedLockedMenu = false;
     if (!positionLocked) {
+      // Send the final position before drag_end so the snap decision in
+      // drag_end sees where the cursor actually released.
+      if (rafPending) {
+        rafPending = false;
+        invoke('drag_move', { x: pendingX, y: pendingY });
+      }
       invoke('drag_end');
     }
   }
 
+  function onPointerUp(e: PointerEvent) {
+    endPointer(e);
+  }
+
   function onPointerCancel(e: PointerEvent) {
-    if (!pointerActive) return;
-    (e.target as Element)?.releasePointerCapture(e.pointerId);
-    pointerActive = false;
-    activePointerId = null;
-    snapSide = null;
-    promptedLockedMenu = false;
-    if (!positionLocked) {
-      invoke('drag_end');
-    }
+    endPointer(e);
   }
 
   function onKeyDown(e: KeyboardEvent) {

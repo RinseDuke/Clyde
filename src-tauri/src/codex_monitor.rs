@@ -229,9 +229,21 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
+/// Build a `wsl.exe` command with CREATE_NO_WINDOW — this app is a GUI process
+/// (no console), so a console-subsystem child would otherwise pop a visible
+/// CMD window on every spawn.
+#[cfg(target_os = "windows")]
+fn silenced_wsl() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 #[cfg(target_os = "windows")]
 fn wsl_codex_roots() -> Vec<PathBuf> {
-    let output = match std::process::Command::new("wsl.exe").args(["-l", "-q"]).output() {
+    let output = match silenced_wsl().args(["-l", "-q"]).output() {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -245,7 +257,7 @@ fn wsl_codex_roots() -> Vec<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn build_wsl_codex_roots_for_distro(distro: &str) -> Vec<PathBuf> {
-    let output = match std::process::Command::new("wsl.exe")
+    let output = match silenced_wsl()
         .args(["-d", distro, "--", "sh", "-lc", "printf %s \"$HOME\""])
         .output()
     {

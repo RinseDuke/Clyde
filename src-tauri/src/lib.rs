@@ -90,6 +90,9 @@ struct DragState {
     start_mouse_x: f64,
     start_mouse_y: f64,
     drag_scale_factor: f64,
+    /// Last snap side emitted to the frontend — preview events are sent only
+    /// when this changes, not on every pointer move.
+    last_snap_side: Option<mini::SnapSide>,
 }
 type SharedDrag = Arc<Mutex<DragState>>;
 
@@ -362,7 +365,7 @@ fn drag_start(app: AppHandle, drag: tauri::State<SharedDrag>, x: f64, y: f64) {
     // If pet bounds are unavailable (rare, e.g. during animation), use last known or 0,0.
     d.active = true;
     d.dragging = false;
-
+    d.last_snap_side = None;
 
     if let Some(pet) = app.get_webview_window("pet") {
         let scale_factor = pet.scale_factor().unwrap_or(1.0);
@@ -464,10 +467,21 @@ fn drag_move(app: AppHandle, drag: tauri::State<SharedDrag>, x: f64, y: f64) {
     // to the frontend. Re-rendering hit-zone divs mid-drag disrupts pointer events.
     let profile = current_hit_profile(&app);
     let _ = windows::sync_hit_window(&app, &updated, &profile);
-    emit_snap_preview(
-        &app,
-        mini::edge_snap_for_bounds(&app, &updated).map(|snap| snap.side),
-    );
+    // Emit the snap preview only when the side changes — a per-move emit is
+    // wasted frontend work.
+    let side = mini::edge_snap_for_bounds(&app, &updated).map(|snap| snap.side);
+    let side_changed = {
+        let mut d = drag.lock_or_recover();
+        if d.last_snap_side == side {
+            false
+        } else {
+            d.last_snap_side = side;
+            true
+        }
+    };
+    if side_changed {
+        emit_snap_preview(&app, side);
+    }
 }
 
 #[tauri::command]
@@ -970,6 +984,14 @@ pub(crate) fn do_toggle_dnd(app: &AppHandle, state: &SharedState) {
         sm.dnd
     };
     let _ = app.emit("dnd-change", serde_json::json!({ "enabled": new_dnd }));
+    // DND changed — refresh tray so its ✓ checkmark stays truthful (the
+    // context-menu and tray paths rebuild themselves; the command path didn't).
+    if let Some(lang) = app
+        .try_state::<SharedPrefs>()
+        .map(|prefs| prefs.lock_or_recover().lang.clone())
+    {
+        tray::rebuild_menu(app, &lang);
+    }
 }
 
 pub(crate) fn set_auto_dnd(app: &AppHandle, state: &SharedState, enabled: bool) {
@@ -1815,6 +1837,7 @@ pub fn run() {
         start_mouse_x: 0.0,
         start_mouse_y: 0.0,
         drag_scale_factor: 1.0,
+        last_snap_side: None,
     }));
     let shared_state: SharedState = Arc::new(Mutex::new(StateMachine::new()));
     let pending_perms: PendingPerms = Arc::new(Mutex::new(HashMap::new()));
@@ -1830,6 +1853,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .manage(drag_state)
+        .manage(windows::MonitorCache::new())
         .manage(shared_state.clone())
         .manage(pending_perms.clone())
         .manage(approval_queue.clone())
@@ -1891,9 +1915,22 @@ pub fn run() {
                                 do_hide_to_tray(&handle_for_close);
                             }
                         }
-                        tauri::WindowEvent::Moved(_)
-                        | tauri::WindowEvent::Resized(_)
+                        tauri::WindowEvent::Moved(_) => {
+                            // Drag fires this per set_position — the drag path
+                            // already syncs the hit window, so spawning a
+                            // repair task per move is wasted churn.
+                            if !drag_in_progress(&handle_for_close) {
+                                schedule_display_repair(handle_for_close.clone());
+                            }
+                        }
+                        tauri::WindowEvent::Resized(_)
                         | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                            // DPI/display change — drop cached monitor geometry.
+                            if let Some(cache) =
+                                handle_for_close.try_state::<windows::MonitorCache>()
+                            {
+                                cache.clear();
+                            }
                             schedule_display_repair(handle_for_close.clone());
                         }
                         _ => {}

@@ -22,17 +22,20 @@ pub struct HitProfile {
 }
 
 const STANDING_RECTS: &[RelativeHitRect] = &[
+    // Upper body incl. head — head top was previously uncovered (y started at
+    // 0.20), which made right-clicks on the head fall through to the desktop.
     RelativeHitRect {
-        x: 0.27,
-        y: 0.20,
-        width: 0.46,
-        height: 0.50,
+        x: 0.24,
+        y: 0.12,
+        width: 0.52,
+        height: 0.58,
     },
+    // Lower body incl. feet — extends past the old 0.86 bottom edge.
     RelativeHitRect {
-        x: 0.20,
-        y: 0.56,
-        width: 0.60,
-        height: 0.30,
+        x: 0.18,
+        y: 0.58,
+        width: 0.64,
+        height: 0.32,
     },
 ];
 

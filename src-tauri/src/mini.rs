@@ -31,7 +31,7 @@ impl PeekSuppressDeadline {
 }
 
 /// Logical-pixel constants — must be scaled by DPI before use in physical coords.
-const SNAP_TOLERANCE_LP: f64 = 30.0;
+const SNAP_TOLERANCE_LP: f64 = 40.0;
 const PEEK_OFFSET_LP: f64 = 25.0;
 pub const MINI_OFFSET_RATIO: f64 = 0.486;
 
@@ -76,6 +76,18 @@ fn suppress_peek_until_mouse_exit(app: &AppHandle) {
 /// Snap tolerance in physical pixels for the current DPI.
 pub fn snap_tolerance(app: &AppHandle) -> i32 {
     (SNAP_TOLERANCE_LP * windows::pet_scale_factor(app)).round() as i32
+}
+
+/// If `x` places a `pet_w`-wide pet inside either edge's snap band, push it
+/// just outside the band (inward). Used when restoring from mini mode so the
+/// pet can't instantly re-snap. Monitors too small for the band are left alone.
+pub(crate) fn nudge_out_of_snap_band(x: i32, pet_w: u32, monitor: &MonitorArea, band: i32) -> i32 {
+    let left_limit = monitor.x + band;
+    let right_limit = monitor.x + monitor.width as i32 - band - pet_w as i32;
+    if left_limit > right_limit {
+        return x;
+    }
+    x.clamp(left_limit, right_limit)
 }
 
 /// Peek offset in physical pixels for the current DPI.
@@ -206,10 +218,10 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
     let Some(prefs_state) = app.try_state::<SharedPrefs>() else {
         return false;
     };
-    let monitor_key = get_pet_bounds(app)
-        .and_then(|bounds| windows::monitor_for_bounds(app, &bounds))
-        .map(|monitor| monitor.key);
-    let (was_mini, restore_x, restore_y) = {
+    let monitor = get_pet_bounds(app)
+        .and_then(|bounds| windows::monitor_for_bounds(app, &bounds));
+    let monitor_key = monitor.as_ref().map(|m| m.key.clone());
+    let (was_mini, mut restore_x, restore_y) = {
         let mut p = prefs_state.lock_or_recover();
         if !p.mini_mode {
             return false;
@@ -226,6 +238,14 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
     if !was_mini {
         return false;
     }
+    // Keep the restored position out of either edge snap band — restoring to
+    // a position inside the band re-triggers mini mode on the next tiny drag.
+    if let Some(m) = monitor.as_ref() {
+        let pet_w = get_pet_bounds(app)
+            .map(|b| b.width)
+            .unwrap_or(crate::prefs::DEFAULT_PET_DIMENSION);
+        restore_x = nudge_out_of_snap_band(restore_x, pet_w, m, snap_tolerance(app) + 20);
+    }
     if let Some(pet) = app.get_webview_window("pet") {
         let _ = pet.set_position(PhysicalPosition::new(restore_x, restore_y));
     }
@@ -240,6 +260,9 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
     };
     emit_state(app, &resolved, &svg);
     sync_hit(app);
+    // Mini mode changed from a non-tray path (drag, exit_mini_mode command) —
+    // refresh the tray so its ✓ Mini Mode checkmark stays truthful.
+    rebuild_tray(app);
     true
 }
 
@@ -280,9 +303,15 @@ pub fn do_enter_mini(app: &AppHandle) -> bool {
         p.pre_mini_x = bounds.x;
         p.pre_mini_y = bounds.y;
         p.mini_mode = true;
+        // Keep the stored on-screen position for restore: overwriting it with
+        // the near-edge release position made exit-mini drop the pet right
+        // back into the snap band (re-snap loop). Only fresh entries get coords.
+        let is_new = !p.monitor_positions.contains_key(&monitor.key);
         let placement = p.monitor_positions.entry(monitor.key.clone()).or_default();
-        placement.x = bounds.x;
-        placement.y = bounds.y;
+        if is_new {
+            placement.x = bounds.x;
+            placement.y = bounds.y;
+        }
         placement.mini_side = Some(snap_side_key(side).into());
         prefs::save(app, &p);
     }
@@ -294,7 +323,22 @@ pub fn do_enter_mini(app: &AppHandle) -> bool {
     suppress_peek_until_mouse_exit(app);
     // animate_to_x automatically syncs hit window when animation completes
     animate_to_x(app, hidden_x, 300);
+    // Entered via drag or command — refresh tray checkmark (idempotent if the
+    // tray handler already rebuilds).
+    rebuild_tray(app);
     true
+}
+
+/// Rebuild the tray menu with the current language. Reads prefs in a scoped
+/// lock and releases it before rebuilding (rebuild takes the same locks).
+fn rebuild_tray(app: &AppHandle) {
+    let Some(lang) = app
+        .try_state::<SharedPrefs>()
+        .map(|p| p.lock_or_recover().lang.clone())
+    else {
+        return;
+    };
+    crate::tray::rebuild_menu(app, &lang);
 }
 
 /// Animate window with parabolic arc (jump transition).
@@ -398,4 +442,84 @@ pub fn animate_to_x(app: &AppHandle, target_x: i32, duration_ms: u64) {
             sync_hit(&app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(x: i32, width: u32) -> MonitorArea {
+        MonitorArea {
+            key: "test".into(),
+            x,
+            y: 0,
+            width,
+            height: 1040,
+        }
+    }
+
+    #[test]
+    fn test_nudge_pushes_out_of_left_band() {
+        // Left snap triggers when x <= monitor.x + band; restore must clear it.
+        let m = monitor(0, 1920);
+        assert_eq!(nudge_out_of_snap_band(20, 96, &m, 60), 60);
+    }
+
+    #[test]
+    fn test_nudge_pushes_out_of_right_band() {
+        // Right snap triggers when pet_right >= monitor_right - band.
+        let m = monitor(0, 1920);
+        assert_eq!(nudge_out_of_snap_band(1820, 96, &m, 60), 1764);
+    }
+
+    #[test]
+    fn test_nudge_keeps_mid_screen_position() {
+        let m = monitor(0, 1920);
+        assert_eq!(nudge_out_of_snap_band(960, 96, &m, 60), 960);
+    }
+
+    #[test]
+    fn test_nudge_uses_monitor_origin() {
+        // Work area starts at x=60 (taskbar on the left) — limits are relative.
+        let m = monitor(60, 1860);
+        assert_eq!(nudge_out_of_snap_band(70, 96, &m, 60), 120);
+    }
+
+    #[test]
+    fn test_nudge_tiny_monitor_left_alone() {
+        // Band wider than the monitor: don't fight it.
+        let m = monitor(0, 120);
+        assert_eq!(nudge_out_of_snap_band(10, 96, &m, 60), 10);
+    }
+
+    #[test]
+    fn test_hidden_x_left_side_visible_strip_sits_beside_taskbar() {
+        // Work area x=60 (60px taskbar on the physical left edge), pet 96 wide.
+        let m = monitor(60, 1860);
+        let snap = EdgeSnap {
+            monitor: m,
+            width: 96,
+            side: SnapSide::Left,
+        };
+        let hidden = snap.hidden_x();
+        // Pet partially off the work area's left edge, but the visible strip
+        // (work_area_right - pet_right equivalent) lies INSIDE the work area,
+        // i.e. beside the taskbar, not underneath it.
+        assert!(hidden < 60, "pet must be partially off-screen: {hidden}");
+        assert!(hidden + 96 > 60, "visible strip must start at the taskbar edge: {hidden}");
+    }
+
+    #[test]
+    fn test_hidden_x_right_side_visible_strip_sits_beside_taskbar() {
+        let m = monitor(60, 1860);
+        let snap = EdgeSnap {
+            monitor: m,
+            width: 96,
+            side: SnapSide::Right,
+        };
+        let hidden = snap.hidden_x();
+        let work_right = 60 + 1860;
+        assert!(hidden + 96 > work_right, "pet must be partially off-screen: {hidden}");
+        assert!(hidden < work_right, "visible strip must sit inside the work area: {hidden}");
+    }
 }
