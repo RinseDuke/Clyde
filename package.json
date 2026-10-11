@@ -11,7 +11,7 @@
     "demo:permissions": "bash scripts/demo-permissions.sh queue",
     "tauri": "tauri",
     "start": "tauri dev",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml && node --test hooks/tests/install-permission-request.test.cjs",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml && node --test hooks/tests/install-permission-request.test.cjs hooks/tests/drag-controller.test.mjs",
     "test:hooks": "node --test hooks/tests/install-permission-request.test.cjs"
   },
   "devDependencies": {

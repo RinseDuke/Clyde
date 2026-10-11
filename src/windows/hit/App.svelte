@@ -1,25 +1,14 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { cursorPosition } from '@tauri-apps/api/window';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy, onMount } from 'svelte';
+  import { createDragController } from './drag-controller';
+  import { percentRegions, type HitRegion, type HitLayoutPayload } from './hit-layout';
 
   interface InteractionState {
     position_locked: boolean;
     click_through: boolean;
-  }
-
-  interface HitRegion {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }
-
-  interface HitLayoutPayload {
-    width: number;
-    height: number;
-    regions: HitRegion[];
-    pointer_alpha?: number;
   }
 
   const DRAG_THRESHOLD_PHYSICAL_PX = 3;
@@ -31,14 +20,23 @@
   let startY = 0;
   let clickCount = 0;
   let clickTimer: ReturnType<typeof setTimeout> | null = null;
-  let snapSide: 'left' | 'right' | null = null;
   let positionLocked = false;
   let promptedLockedMenu = false;
   let regions: HitRegion[] = [];
   let pointerAlpha = 0;
-  let unlistenSnap: UnlistenFn | null = null;
   let unlistenInteraction: UnlistenFn | null = null;
   let unlistenLayout: UnlistenFn | null = null;
+  const drag = createDragController({
+    start: point => invoke<number>('drag_start', { x: point.x, y: point.y }),
+    move: dragId => invoke('drag_move', { dragId }),
+    end: (dragId, point, cancelled) => invoke('drag_end', {
+      dragId, x: point?.x ?? null, y: point?.y ?? null, cancelled,
+    }),
+    cursor: cursorPosition,
+    frame: callback => requestAnimationFrame(callback),
+    cancelFrame: cancelAnimationFrame,
+    error: error => console.error('Clyde drag:', error),
+  });
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return; // Only handle left click — right click goes to onContextMenu
@@ -53,7 +51,7 @@
     (e.target as Element)?.setPointerCapture(e.pointerId);
     if (positionLocked) return;
 
-    invoke('drag_start', { x: startX, y: startY });
+    drag.start();
 
     clickCount++;
     if (clickTimer) clearTimeout(clickTimer);
@@ -69,19 +67,6 @@
 
   function dragDistanceThresholdLogicalPx() {
     return DRAG_THRESHOLD_PHYSICAL_PX / (window.devicePixelRatio || 1);
-  }
-
-  // Coalesce pointermove → at most one drag_move IPC per animation frame.
-  // High-polling mice emit hundreds of moves/sec; one IPC round-trip each
-  // built a queue that made the window trail the cursor (rubber-banding).
-  let pendingX = 0;
-  let pendingY = 0;
-  let rafPending = false;
-
-  function flushDragMove() {
-    rafPending = false;
-    if (!pointerActive || positionLocked) return;
-    invoke('drag_move', { x: pendingX, y: pendingY });
   }
 
   function onPointerMove(e: PointerEvent) {
@@ -101,33 +86,28 @@
     if (!isDragging) {
       const dx = e.screenX - startX;
       const dy = e.screenY - startY;
-      if (Math.sqrt(dx * dx + dy * dy) >= dragDistanceThresholdLogicalPx()) isDragging = true;
+      if (Math.sqrt(dx * dx + dy * dy) >= dragDistanceThresholdLogicalPx()) {
+        isDragging = true;
+        clickCount = 0;
+        if (clickTimer) clearTimeout(clickTimer);
+      }
     }
-    pendingX = e.screenX;
-    pendingY = e.screenY;
-    if (!rafPending) {
-      rafPending = true;
-      requestAnimationFrame(flushDragMove);
-    }
+    drag.move();
   }
 
-  function endPointer(e: PointerEvent) {
+  function endPointer(e: PointerEvent, cancelled = false) {
     if (!pointerActive) return;
     if (activePointerId !== null && e.pointerId !== activePointerId) return;
-    (e.target as Element)?.releasePointerCapture(e.pointerId);
+    const target = e.target as Element;
     pointerActive = false;
     activePointerId = null;
-    snapSide = null;
     promptedLockedMenu = false;
-    if (!positionLocked) {
-      // Send the final position before drag_end so the snap decision in
-      // drag_end sees where the cursor actually released.
-      if (rafPending) {
-        rafPending = false;
-        invoke('drag_move', { x: pendingX, y: pendingY });
-      }
-      invoke('drag_end');
+    if (target?.hasPointerCapture(e.pointerId)) target.releasePointerCapture(e.pointerId);
+    if (cancelled && clickTimer) {
+      clearTimeout(clickTimer);
+      clickCount = 0;
     }
+    void drag.end(cancelled);
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -135,7 +115,11 @@
   }
 
   function onPointerCancel(e: PointerEvent) {
-    endPointer(e);
+    endPointer(e, true);
+  }
+
+  function onLostPointerCapture(e: PointerEvent) {
+    if (pointerActive) endPointer(e, true);
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -155,22 +139,18 @@
       const interaction = await invoke<InteractionState>('get_interaction_state');
       positionLocked = interaction.position_locked ?? false;
 
-      unlistenSnap = await listen<{ active: boolean; side: 'left' | 'right' | null }>('snap-preview', ({ payload }) => {
-        snapSide = payload.active ? payload.side : null;
-      });
-
       unlistenInteraction = await listen<InteractionState>('interaction-state-changed', ({ payload }) => {
         positionLocked = payload.position_locked ?? false;
       });
 
       unlistenLayout = await listen<HitLayoutPayload>('hit-layout-changed', ({ payload }) => {
-        regions = payload.regions ?? [];
+        regions = percentRegions(payload);
         pointerAlpha = payload.pointer_alpha ?? 0;
       });
 
       const initialLayout = await invoke<HitLayoutPayload | null>('get_current_hit_layout');
       if (initialLayout) {
-        regions = initialLayout.regions ?? [];
+        regions = percentRegions(initialLayout);
         pointerAlpha = initialLayout.pointer_alpha ?? 0;
       }
 
@@ -185,7 +165,7 @@
     window.removeEventListener('pointermove', onPointerMove);
     window.removeEventListener('pointerup', onPointerUp);
     window.removeEventListener('pointercancel', onPointerCancel);
-    unlistenSnap?.();
+    void drag.end(true);
     unlistenInteraction?.();
     unlistenLayout?.();
     if (clickTimer) clearTimeout(clickTimer);
@@ -197,13 +177,12 @@
     <div
       class="hit-zone"
       class:locked={positionLocked}
-      class:snap-left={snapSide === 'left'}
-      class:snap-right={snapSide === 'right'}
-      style:left={`${region.x}px`}
-      style:top={`${region.y}px`}
-      style:width={`${region.width}px`}
-      style:height={`${region.height}px`}
+      style:left={`${region.x}%`}
+      style:top={`${region.y}%`}
+      style:width={`${region.width}%`}
+      style:height={`${region.height}%`}
       onpointerdown={onPointerDown}
+      onlostpointercapture={onLostPointerCapture}
       oncontextmenu={onContextMenu}
       onkeydown={onKeyDown}
       role="button"
@@ -236,30 +215,7 @@
     cursor: not-allowed;
   }
 
-  .hit-zone::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: 16px;
-    opacity: 0;
-    transition: opacity 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
-    pointer-events: none;
-    border: 2px solid transparent;
-  }
-
-  .hit-zone.snap-left::after,
-  .hit-zone.snap-right::after {
-    opacity: 1;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12), 0 10px 24px rgba(59, 130, 246, 0.2);
-  }
-
-  .hit-zone.snap-left::after {
-    border-left-color: rgba(59, 130, 246, 0.9);
-    background: linear-gradient(90deg, rgba(59, 130, 246, 0.22), transparent 42%);
-  }
-
-  .hit-zone.snap-right::after {
-    border-right-color: rgba(59, 130, 246, 0.9);
-    background: linear-gradient(270deg, rgba(59, 130, 246, 0.22), transparent 42%);
+  .hit-zone:focus:not(:focus-visible) {
+    outline: none;
   }
 </style>

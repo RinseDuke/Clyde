@@ -31,7 +31,8 @@ impl PeekSuppressDeadline {
 }
 
 /// Logical-pixel constants — must be scaled by DPI before use in physical coords.
-const SNAP_TOLERANCE_LP: f64 = 40.0;
+const SNAP_TOLERANCE_LP: f64 = 12.0;
+const SNAP_RELEASE_LP: f64 = 24.0;
 const PEEK_OFFSET_LP: f64 = 25.0;
 pub const MINI_OFFSET_RATIO: f64 = 0.486;
 
@@ -102,6 +103,52 @@ pub enum SnapSide {
     Right,
 }
 
+/// Stable subject bounds: SVG viewBox x=-15..30, Clyde's body x=0..15.
+/// Transparent SVG margins and changing animation props are not snap targets.
+pub(crate) fn snap_side_for_body(
+    bounds: &WindowBounds,
+    monitor: &MonitorArea,
+    scale: f64,
+    previous: Option<SnapSide>,
+) -> Option<SnapSide> {
+    let left = bounds.x as f64 + bounds.width as f64 / 3.0;
+    let right = bounds.x as f64 + bounds.width as f64 * 2.0 / 3.0;
+    let top = bounds.y as f64 + bounds.height as f64 * 31.0 / 45.0;
+    let bottom = bounds.y as f64 + bounds.height as f64 * 41.0 / 45.0;
+    let screen_right = monitor.x as f64 + monitor.width as f64;
+    if right <= monitor.x as f64 || left >= screen_right
+        || bottom <= monitor.y as f64 || top >= (monitor.y as f64 + monitor.height as f64)
+    {
+        return None;
+    }
+    let left_gap = left - monitor.x as f64;
+    let right_gap = screen_right - right;
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let hold = SNAP_RELEASE_LP * scale;
+    match previous {
+        Some(SnapSide::Left) if left_gap <= hold => return previous,
+        Some(SnapSide::Right) if right_gap <= hold => return previous,
+        _ => {}
+    }
+    let enter = SNAP_TOLERANCE_LP * scale;
+    match (left_gap <= enter, right_gap <= enter) {
+        (true, true) if left_gap.abs() <= right_gap.abs() => Some(SnapSide::Left),
+        (_, true) => Some(SnapSide::Right),
+        (true, false) => Some(SnapSide::Left),
+        _ => None,
+    }
+}
+
+pub(crate) fn drag_snap_for_bounds(
+    bounds: &WindowBounds,
+    monitor: MonitorArea,
+    scale: f64,
+    previous: Option<SnapSide>,
+) -> Option<EdgeSnap> {
+    let side = snap_side_for_body(bounds, &monitor, scale, previous)?;
+    Some(EdgeSnap { monitor, width: bounds.width, side })
+}
+
 pub fn should_snap_to_edge(app: &AppHandle) -> Option<EdgeSnap> {
     let bounds = get_pet_bounds(app)?;
     edge_snap_for_bounds(app, &bounds)
@@ -131,6 +178,7 @@ pub fn edge_snap_for_bounds(app: &AppHandle, bounds: &WindowBounds) -> Option<Ed
     }
 }
 
+#[derive(Clone)]
 pub struct EdgeSnap {
     pub monitor: MonitorArea,
     pub width: u32,
@@ -168,27 +216,6 @@ pub fn snap_side_from_key(side: &str) -> Option<SnapSide> {
     }
 }
 
-pub fn remember_snap_for_current_monitor(app: &AppHandle) {
-    let Some(snap) = should_snap_to_edge(app) else {
-        return;
-    };
-    let Some(bounds) = get_pet_bounds(app) else {
-        return;
-    };
-    let Some(prefs_state) = app.try_state::<SharedPrefs>() else {
-        return;
-    };
-    let mut prefs = prefs_state.lock_or_recover();
-    let placement = prefs
-        .monitor_positions
-        .entry(snap.monitor.key.clone())
-        .or_default();
-    placement.x = bounds.x;
-    placement.y = bounds.y;
-    placement.mini_side = Some(snap_side_key(snap.side).into());
-    prefs::save(app, &prefs);
-}
-
 fn preferred_snap_side(
     monitor: &MonitorArea,
     bounds: &WindowBounds,
@@ -215,6 +242,11 @@ fn preferred_snap_side(
 /// Exit mini mode: restore position, emit idle state, sync hit window.
 /// Returns true if the pet was in mini mode and was restored.
 pub fn do_exit_mini(app: &AppHandle) -> bool {
+    exit_mini_at(app, None)
+}
+
+pub(crate) fn exit_mini_at(app: &AppHandle, dropped: Option<WindowBounds>) -> bool {
+    cancel_motion(app);
     let Some(prefs_state) = app.try_state::<SharedPrefs>() else {
         return false;
     };
@@ -227,10 +259,10 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
             return false;
         }
         p.mini_mode = false;
-        let restore = monitor_key
+        let restore = dropped.map(|bounds| (bounds.x, bounds.y)).or_else(|| monitor_key
             .as_ref()
             .and_then(|key| p.monitor_positions.get(key))
-            .map(|placement| (placement.x, placement.y))
+            .map(|placement| (placement.x, placement.y)))
             .unwrap_or((p.pre_mini_x, p.pre_mini_y));
         prefs::save(app, &p);
         (true, restore.0, restore.1)
@@ -240,7 +272,7 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
     }
     // Keep the restored position out of either edge snap band — restoring to
     // a position inside the band re-triggers mini mode on the next tiny drag.
-    if let Some(m) = monitor.as_ref() {
+    if let Some(m) = monitor.as_ref().filter(|_| dropped.is_none()) {
         let pet_w = get_pet_bounds(app)
             .map(|b| b.width)
             .unwrap_or(crate::prefs::DEFAULT_PET_DIMENSION);
@@ -269,20 +301,22 @@ pub fn do_exit_mini(app: &AppHandle) -> bool {
 /// Enter mini mode: save current position, animate to edge, emit mini state.
 /// Returns true if mini mode was entered.
 pub fn do_enter_mini(app: &AppHandle) -> bool {
+    let Some(bounds) = get_pet_bounds(app) else { return false; };
+    enter_mini_at(app, bounds, None)
+}
+
+pub(crate) fn enter_mini_at(app: &AppHandle, bounds: WindowBounds, chosen: Option<EdgeSnap>) -> bool {
     let Some(prefs_state) = app.try_state::<SharedPrefs>() else {
         return false;
     };
-    let bounds = match get_pet_bounds(app) {
-        Some(bounds) => bounds,
-        None => return false,
-    };
-    let monitor = match windows::monitor_for_bounds(app, &bounds) {
+    let monitor = match chosen.as_ref().map(|snap| snap.monitor.clone())
+        .or_else(|| windows::monitor_for_bounds(app, &bounds)) {
         Some(monitor) => monitor,
         None => return false,
     };
 
     // Determine target X: from edge snap (left or right), or default to right edge
-    let (hidden_x, side) = if let Some(snap) = edge_snap_for_bounds(app, &bounds) {
+    let (hidden_x, side) = if let Some(snap) = chosen.or_else(|| edge_snap_for_bounds(app, &bounds)) {
         (snap.hidden_x(), snap.side)
     } else {
         // Not near any edge (triggered from tray/context menu) — use preferred side or default to right
@@ -300,8 +334,10 @@ pub fn do_enter_mini(app: &AppHandle) -> bool {
 
     {
         let mut p = prefs_state.lock_or_recover();
-        p.pre_mini_x = bounds.x;
-        p.pre_mini_y = bounds.y;
+        if !p.mini_mode {
+            p.pre_mini_x = bounds.x;
+            p.pre_mini_y = bounds.y;
+        }
         p.mini_mode = true;
         // Keep the stored on-screen position for restore: overwriting it with
         // the near-edge release position made exit-mini drop the pet right
@@ -377,6 +413,7 @@ pub fn animate_parabola(
 
 /// Peek in: slide to peek position (absolute, not relative — prevents drift)
 pub fn peek_in(app: &AppHandle) {
+    if crate::drag_in_progress(app) { return; }
     if let Some(snap) = should_snap_to_edge(app) {
         let offset = peek_offset(app);
         let target_x = match snap.side {
@@ -389,6 +426,7 @@ pub fn peek_in(app: &AppHandle) {
 
 /// Peek out: slide back to hidden position
 pub fn peek_out(app: &AppHandle) {
+    if crate::drag_in_progress(app) { return; }
     if let Some(snap) = should_snap_to_edge(app) {
         animate_to_x(app, snap.hidden_x(), 200);
     }
@@ -397,7 +435,14 @@ pub fn peek_out(app: &AppHandle) {
 /// Animate window to target X in steps (ease-out quadratic).
 /// Bumps the generation counter so any in-flight animation stops.
 /// Syncs hit window only if this animation was not superseded.
+pub(crate) fn cancel_motion(app: &AppHandle) {
+    if let Some(generation) = app.try_state::<AnimationGeneration>() {
+        generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 pub fn animate_to_x(app: &AppHandle, target_x: i32, duration_ms: u64) {
+    if crate::drag_in_progress(app) { return; }
     // Bump generation — any older animation will see its gen is stale and stop
     let gen = app
         .try_state::<AnimationGeneration>()
@@ -429,7 +474,7 @@ pub fn animate_to_x(app: &AppHandle, target_x: i32, duration_ms: u64) {
             let mut interval = tokio::time::interval(Duration::from_millis(16));
             for i in 1..=steps {
                 interval.tick().await;
-                if gen_arc.load(Ordering::SeqCst) != my_gen {
+                if gen_arc.load(Ordering::SeqCst) != my_gen || crate::drag_in_progress(&app) {
                     return; // superseded by a newer animation
                 }
                 let t = i as f64 / steps as f64;
@@ -455,7 +500,58 @@ mod tests {
             y: 0,
             width,
             height: 1040,
+            scale_factor: 1.0,
         }
+    }
+
+    fn body_bounds(x: i32) -> WindowBounds {
+        WindowBounds { x, y: 100, width: 180, height: 180 }
+    }
+
+    #[test]
+    fn transparent_margin_does_not_trigger_snap() {
+        // Window starts at 5, but subject starts at 65: much farther than 12.
+        assert_eq!(snap_side_for_body(&body_bounds(5), &monitor(0, 1920), 1.0, None), None);
+    }
+
+    #[test]
+    fn body_snap_uses_enter_and_release_hysteresis() {
+        let m = monitor(0, 1920);
+        assert_eq!(snap_side_for_body(&body_bounds(-49), &m, 1.0, None), Some(SnapSide::Left));
+        assert_eq!(snap_side_for_body(&body_bounds(-40), &m, 1.0, None), None);
+        assert_eq!(snap_side_for_body(&body_bounds(-40), &m, 1.0, Some(SnapSide::Left)), Some(SnapSide::Left));
+        assert_eq!(snap_side_for_body(&body_bounds(-35), &m, 1.0, Some(SnapSide::Left)), None);
+    }
+
+    #[test]
+    fn right_body_edge_snaps_symmetrically() {
+        let m = monitor(0, 1920);
+        assert_eq!(snap_side_for_body(&body_bounds(1789), &m, 1.0, None), Some(SnapSide::Right));
+        assert_eq!(snap_side_for_body(&body_bounds(1780), &m, 1.0, None), None);
+        assert_eq!(snap_side_for_body(&body_bounds(1780), &m, 1.0, Some(SnapSide::Right)), Some(SnapSide::Right));
+    }
+
+    #[test]
+    fn snap_threshold_scales_for_high_dpi() {
+        let m = monitor(0, 1920);
+        assert_eq!(snap_side_for_body(&body_bounds(-44), &m, 1.0, None), None);
+        assert_eq!(snap_side_for_body(&body_bounds(-44), &m, 1.5, None), Some(SnapSide::Left));
+    }
+
+    #[test]
+    fn body_snap_supports_negative_origin_and_side_taskbar() {
+        let m = monitor(-1860, 1860);
+        assert_eq!(snap_side_for_body(&body_bounds(-1910), &m, 1.0, None), Some(SnapSide::Left));
+        assert_eq!(snap_side_for_body(&body_bounds(-130), &m, 1.0, None), Some(SnapSide::Right));
+    }
+
+    #[test]
+    fn offscreen_body_is_not_a_snap_target() {
+        let m = monitor(0, 1920);
+        assert_eq!(snap_side_for_body(&body_bounds(-180), &m, 1.0, None), None);
+        let mut bounds = body_bounds(-50);
+        bounds.y = 1100;
+        assert_eq!(snap_side_for_body(&bounds, &m, 1.0, None), None);
     }
 
     #[test]

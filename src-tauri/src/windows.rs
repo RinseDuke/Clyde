@@ -55,6 +55,7 @@ pub struct HitLayout {
 
 #[derive(Debug, Clone)]
 pub struct MonitorArea {
+    pub scale_factor: f64,
     pub key: String,
     pub x: i32,
     pub y: i32,
@@ -161,6 +162,7 @@ pub fn monitor_area(monitor: &Monitor) -> MonitorArea {
         y: work.position.y,
         width: work.size.width,
         height: work.size.height,
+        scale_factor: monitor.scale_factor(),
     }
 }
 
@@ -238,6 +240,7 @@ pub fn available_monitor_areas(app: &AppHandle) -> Option<Vec<MonitorArea>> {
     Some(areas)
 }
 
+#[cfg(target_os = "macos")]
 pub fn current_monitor_for_pet(app: &AppHandle) -> Option<MonitorArea> {
     if let Some(pet) = app.get_webview_window("pet") {
         if let Ok(Some(monitor)) = pet.current_monitor() {
@@ -462,8 +465,12 @@ pub fn sync_hit_window(
     let hit_win = app.get_webview_window("hit")?;
     let mut layout = compute_hit_layout(pet_bounds, profile)?;
 
-    if let Some(monitor) = monitor_for_bounds(app, pet_bounds) {
-        clamp_layout_to_monitor(&mut layout, &monitor);
+    // Keep the captured pointer's local geometry stable through the edge.
+    // The OS clips the off-screen portion; normal layout is cropped on release.
+    if !crate::drag_in_progress(app) {
+        if let Some(monitor) = monitor_for_bounds(app, pet_bounds) {
+            clamp_layout_to_monitor(&mut layout, &monitor);
+        }
     }
 
     if layout.width == 0 || layout.height == 0 || layout.regions.is_empty() {
@@ -592,6 +599,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let (x, y) = clamp_window_to_monitor(3900, 100, 200, 200, &monitor, 30);
         assert_eq!(x, 3810);
@@ -606,6 +614,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let (x, y) = center_window_in_monitor(360, 360, &monitor);
         assert_eq!(x, 2700);
@@ -626,6 +635,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let right = MonitorArea {
             key: "right".into(),
@@ -633,6 +643,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         assert!(rect_intersection_area(&bounds, &right) > rect_intersection_area(&bounds, &left));
     }
@@ -674,6 +685,7 @@ mod tests {
                 y: 0,
                 width: 1512,
                 height: 982,
+                scale_factor: 1.0,
             },
             MonitorArea {
                 key: "right".into(),
@@ -681,6 +693,7 @@ mod tests {
                 y: 0,
                 width: 2560,
                 height: 1440,
+                scale_factor: 1.0,
             },
         ];
         let (x, y) = startup_position_with_monitors(&bounds, &monitors, 120);
@@ -731,6 +744,7 @@ mod tests {
             y: 100,
             width: 100,
             height: 100,
+            scale_factor: 1.0,
         };
         let mut layout = HitLayout {
             window_x: 0,

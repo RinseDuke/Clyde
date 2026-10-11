@@ -12,7 +12,7 @@
 
 - Clyde:AI coding agent 桌面宠物(Tauri 2.10 + Rust 后端 + Svelte 5 前端)
 - fork 自 QingJ01/Clyde(**AGPL-3.0**),个人魔改使用,不分发、不提供网络服务 → 无开源义务
-- 本地:`C:\Users\Rinse\Clyde`,main @ f537403(v0.1.6)
+- 本地:`C:\Users\Rinse\Clyde`；上游基线 f537403(v0.1.6)，当前修复分支 `fix/edge-snap-20261011`
 - 环境:Node 24 / Rust 1.94 / npm 11;`npm start` = Tauri dev;`npm test` = cargo test + hooks 测试
 - 运行时数据目录:`~/.clyde`;hooks 注册进 `~/.claude/settings.json`
 - 关键架构:事件→状态映射分散在 5 处(clyde-hook.js / copilot-hook.js / state_machine.rs / codex_monitor.rs / claude_monitor.rs),加新状态要全改
@@ -38,6 +38,21 @@
 
 **备选未立项**:原生 `startDragging()` 拖拽重写(T4 后实测仍不满意才立项);点击穿透开启时的气泡提示(可复用 permission.rs mode-notice 机制)。
 
+## 第二批修复
+
+| ID | 任务 | 状态 | 主要文件 |
+|----|------|------|----------|
+| T5 | 移除蓝色吸附框/缩放预览；修正高 DPI 命中区域；主体边缘吸附及迟滞；拖拽收尾与动画互斥 | 已完成（待 Windows 原生实测） | hit/App.svelte、pet/App.svelte、lib.rs、mini.rs、windows.rs、tick.rs |
+
+Git 留档：用户于 2026-10-11 授权提交；修复分支 `fix/edge-snap-20261011`，修复前快照 `478e4c2`，保留此前 T1–T4 的所有改动。
+
+T5 验收：`npm test` 99 个 Rust + 18 个 JS 测试全部通过；Vite 生产构建、Tauri release + NSIS 打包成功。`hooks/tests/verify-hit-ui.py` 使用 Playwright/Edge、模拟 Tauri IPC，验证 100/125/150/200% DPI 命中区域、无蓝框、鼠标无默认焦点框、松手/取消及宠物尺寸/透明度不变。Windows 原生窗口移动、不同 DPI 显示器间拖拽手感仍待用户实测，不能将浏览器模拟验收当作原生验收。`npm run check` 仍为项目外 `C:\node_modules\@types` 缺少 undici-types/form-data 的 13 个预存错误，无项目 src 错误。
+
+打包命令：`npm.cmd run tauri -- build --bundles nsis`。
+安装包：`src-tauri/target/release/bundle/nsis/Clyde on Desk_0.1.6_x64-setup.exe`（2,214,543 bytes）。
+SHA256：`73C33B17079EC7255FAB747F06A6A415BAAFCC1BD9379E6AF62A3D180F476FCE`。
+浏览器回归脚本在构建后运行：`python hooks/tests/verify-hit-ui.py`（需 Python Playwright 和 Edge；进程内临时 HTTP 服务自动关闭）。
+
 ## 改动日志
 
 | 日期 | 任务 | 摘要 |
@@ -48,6 +63,7 @@
 | 2026-10-08 | T2 完工 | mini.rs 两函数尾补 rebuild_tray();lib.rs do_toggle_dnd 补 rebuild;hit_regions.rs Standing 区扩至 y 0.12–0.90;cargo test 85 通过 |
 | 2026-10-08 | T3 完工 | windows.rs monitor_area 改 work_area;mini.rs do_enter_mini 不覆写已有坐标、do_exit_mini 加 nudge_out_of_snap_band、容差 30→40;新增 7 个单测(含任务栏两侧场景);cargo test 92 通过 |
 | 2026-10-08 | T4 完工 | hit/App.svelte rAF 合并(松手前补发最终坐标);windows.rs 新增 MonitorCache(TTL 500ms)+ sync_hit_window 比对后跳过未变 set;lib.rs DragState.last_snap_side 差量发 preview、Moved 分支拖拽中不 spawn、ScaleFactorChanged 清缓存;npm test 92+11 全过,vite build 通过,svelte-check 无 src 错误(13 个 node_modules 错误为预存环境问题)。**未做视觉验收,待用户 npm start 实测拖动/吸附/托盘** |
+| 2026-10-11 | T5 完工 | 移除 hit 蓝框与 pet 缩小；命中区域用物理像素比例生成 CSS 百分比；按下/松手立即采样系统物理坐标，串行 IPC、每次拖拽 token、取消不吸附；固定主体边缘 12px 进入/24px 退出迟滞，缓存目标屏 DPI，按实际窗口尺寸维持跨屏抓取点；普通拖动保留睡眠序列，拖动取消 mini 移动/暂停探头；mini 拖出保留松手位置。新增 JS 竞态/DPI 和 Rust 吸附回归、浏览器模拟验收；99+18 测试与 release/NSIS 构建通过，安装包信息见上。 |
 
 **备注**:上游 .gitignore 第 12 行本就忽略 `CLAUDE.md`(本地 agent 自动加载不受影响,仅不会被提交);`MEMORY.md` 不在忽略列表,是否提交由用户决定。
 

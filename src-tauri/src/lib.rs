@@ -82,17 +82,20 @@ struct MenuData {
     environment_controls_supported: bool,
 }
 
+#[derive(Default)]
 struct DragState {
+    id: u64,
     active: bool,
-    dragging: bool, // true once drag threshold is exceeded
-    start_win_x: i32,
-    start_win_y: i32,
+    dragging: bool,
+    start_bounds: Option<windows::WindowBounds>,
     start_mouse_x: f64,
     start_mouse_y: f64,
-    drag_scale_factor: f64,
-    /// Last snap side emitted to the frontend — preview events are sent only
-    /// when this changes, not on every pointer move.
-    last_snap_side: Option<mini::SnapSide>,
+    profile: Option<hit_regions::HitProfile>,
+    snap: Option<mini::EdgeSnap>,
+}
+
+impl DragState {
+    fn accepts(&self, id: u64) -> bool { self.active && self.id == id }
 }
 type SharedDrag = Arc<Mutex<DragState>>;
 
@@ -113,20 +116,6 @@ fn pointer_alpha_for_hit_regions() -> f32 {
 
 fn startup_min_visible(app: &AppHandle) -> i32 {
     (STARTUP_MIN_VISIBLE_LP * windows::pet_scale_factor(app)).round() as i32
-}
-
-fn emit_snap_preview(app: &AppHandle, side: Option<mini::SnapSide>) {
-    let side = side.map(|side| match side {
-        mini::SnapSide::Left => "left",
-        mini::SnapSide::Right => "right",
-    });
-    let _ = app.emit(
-        "snap-preview",
-        serde_json::json!({
-            "active": side.is_some(),
-            "side": side,
-        }),
-    );
 }
 
 fn emit_pet_config(app: &AppHandle, prefs: &prefs::Prefs) {
@@ -335,203 +324,157 @@ fn drag_distance(start: DragPoint, current: DragPoint) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-fn logical_to_physical(point: DragPoint, scale_factor: f64) -> DragPoint {
-    DragPoint {
-        x: point.x * scale_factor,
-        y: point.y * scale_factor,
-    }
-}
-
-fn logical_drag_position(
-    base_x: i32,
-    base_y: i32,
-    start: DragPoint,
-    current: DragPoint,
+fn physical_drag_position(
+    base: &windows::WindowBounds, start: DragPoint, current: DragPoint, size: (u32, u32),
 ) -> (i32, i32) {
-    let dx = (current.x - start.x).round() as i32;
-    let dy = (current.y - start.y).round() as i32;
-    (base_x + dx, base_y + dy)
-}
-
-fn drag_pointer_in_basis(x: f64, y: f64, drag_scale_factor: f64) -> DragPoint {
-    logical_to_physical(DragPoint { x, y }, drag_scale_factor)
+    // Retain the grabbed point when Windows automatically resizes the window
+    // on a DPI change. Absolute screen coordinates never pass through CSS px.
+    let grip_x = (start.x - base.x as f64) * size.0 as f64 / base.width.max(1) as f64;
+    let grip_y = (start.y - base.y as f64) * size.1 as f64 / base.height.max(1) as f64;
+    ((current.x - grip_x).round() as i32, (current.y - grip_y).round() as i32)
 }
 
 #[tauri::command]
-fn drag_start(app: AppHandle, drag: tauri::State<SharedDrag>, x: f64, y: f64) {
-    emit_snap_preview(&app, None);
+fn drag_start(
+    app: AppHandle, drag: tauri::State<SharedDrag>,
+    abort_handle: tauri::State<'_, SleepAbortHandle>,
+    x: f64, y: f64,
+) -> Result<u64, String> {
+    if !x.is_finite() || !y.is_finite() { return Err("Invalid pointer position".into()); }
+    let locked = app.state::<SharedPrefs>().lock_or_recover().lock_position;
+    if locked { return Err("Position is locked".into()); }
+    mini::cancel_motion(&app);
+    let was_mini = prefs::is_mini_mode(&app);
+    if was_mini { cancel_pending_task(&abort_handle); }
+    let bounds = windows::get_pet_bounds(&app).ok_or("Pet window unavailable")?;
+    let profile = current_hit_profile(&app);
+    let snap = if was_mini { mini::edge_snap_for_bounds(&app, &bounds) } else { None };
     let mut d = drag.lock_or_recover();
-    // Always set active so drag_end runs (for click detection, sync_hit, etc.).
-    // If pet bounds are unavailable (rare, e.g. during animation), use last known or 0,0.
+    d.id = d.id.wrapping_add(1);
     d.active = true;
     d.dragging = false;
-    d.last_snap_side = None;
+    d.start_mouse_x = x;
+    d.start_mouse_y = y;
+    d.start_bounds = Some(bounds);
+    d.profile = Some(profile);
+    d.snap = snap;
+    Ok(d.id)
+}
 
-    if let Some(pet) = app.get_webview_window("pet") {
-        let scale_factor = pet.scale_factor().unwrap_or(1.0);
-        d.drag_scale_factor = scale_factor;
-        let start_mouse = logical_to_physical(DragPoint { x, y }, scale_factor);
-        d.start_mouse_x = start_mouse.x;
-        d.start_mouse_y = start_mouse.y;
-
-        // Window position in physical coords to match screen mouse coords
-        if let Ok(pos) = pet.outer_position() {
-            d.start_win_x = pos.x;
-            d.start_win_y = pos.y;
-        }
-    } else {
-        d.drag_scale_factor = 1.0;
-        d.start_mouse_x = x;
-        d.start_mouse_y = y;
+/// Move and snap selection share the same computed physical bounds. Never read
+/// back a possibly delayed window position to make the release decision.
+fn apply_drag_point(app: &AppHandle, drag: &SharedDrag, id: u64, current: DragPoint) -> Option<windows::WindowBounds> {
+    if !current.x.is_finite() || !current.y.is_finite() { return None; }
+    let (base, start, was_dragging, profile, previous) = {
+        let d = drag.lock_or_recover();
+        if !d.accepts(id) { return None; }
+        (d.start_bounds?, DragPoint { x: d.start_mouse_x, y: d.start_mouse_y },
+         d.dragging, d.profile.clone()?, d.snap.clone())
+    };
+    let locked = app.state::<SharedPrefs>().lock_or_recover().lock_position;
+    if locked { return None; }
+    if !was_dragging && drag_distance(start, current) < DRAG_THRESHOLD { return Some(base); }
+    let mut bounds = base;
+    let mut snap = None;
+    // WM_DPICHANGED can resize the pet as set_position crosses a monitor seam.
+    // Observe actual dimensions and settle once more before deciding the snap.
+    for _ in 0..2 {
+        let size = windows::get_pet_bounds(app).map(|b| (b.width, b.height))
+            .unwrap_or((base.width, base.height));
+        let (x, y) = physical_drag_position(&base, start, current, size);
+        bounds = windows::WindowBounds { x, y, width: size.0, height: size.1 };
+        let monitor = windows::available_monitor_areas(app).and_then(|monitors| {
+            monitors.into_iter().find(|monitor| {
+                current.x >= monitor.x as f64 && current.x < monitor.x as f64 + monitor.width as f64
+                    && current.y >= monitor.y as f64 && current.y < monitor.y as f64 + monitor.height as f64
+            })
+        }).or_else(|| windows::monitor_for_bounds(app, &bounds));
+        snap = if let Some(monitor) = monitor {
+            let visible = (bounds.width as f64 / 3.0).ceil() as i32 + 1;
+            (bounds.x, bounds.y) = windows::clamp_window_to_monitor(
+                x, y, bounds.width, bounds.height, &monitor, visible);
+            let bottom_limit = monitor.y + monitor.height as i32
+                - (bounds.height as f64 * 41.0 / 45.0).ceil() as i32;
+            bounds.y = bounds.y.min(bottom_limit.max(monitor.y));
+            let previous_side = previous.as_ref()
+                .filter(|snap| snap.monitor.key == monitor.key).map(|snap| snap.side);
+            let scale = monitor.scale_factor;
+            mini::drag_snap_for_bounds(&bounds, monitor, scale, previous_side)
+        } else { None };
+        if let Some(pet) = app.get_webview_window("pet") {
+            let _ = pet.set_position(PhysicalPosition::new(bounds.x, bounds.y));
+            if pet.outer_size().ok().map(|s| (s.width, s.height)) == Some(size) { break; }
+        } else { return None; }
     }
+    {
+        let mut d = drag.lock_or_recover();
+        if !d.accepts(id) { return None; }
+        d.dragging = true;
+        d.snap = snap;
+    }
+    let _ = windows::sync_hit_window(app, &bounds, &profile);
+    Some(bounds)
 }
 
 #[tauri::command]
-fn drag_move(app: AppHandle, drag: tauri::State<SharedDrag>, x: f64, y: f64) {
-    let (active, dragging, base_x, base_y, smx, smy, drag_scale_factor) = {
-        let d = drag.lock_or_recover();
-        (
-            d.active,
-            d.dragging,
-            d.start_win_x,
-            d.start_win_y,
-            d.start_mouse_x,
-            d.start_mouse_y,
-            d.drag_scale_factor,
-        )
-    };
-    if !active {
-        return;
-    }
-    let locked = app
-        .try_state::<SharedPrefs>()
-        .map(|prefs| prefs.lock_or_recover().lock_position)
-        .unwrap_or(false);
-    if locked {
-        emit_snap_preview(&app, None);
-        return;
-    }
-
-    let current = drag_pointer_in_basis(x, y, drag_scale_factor);
-    let start = DragPoint { x: smx, y: smy };
-
-    // Don't start moving until the mouse has moved past the drag threshold
-    if !dragging {
-        if drag_distance(start, current) < DRAG_THRESHOLD {
-            return;
-        }
-        drag.lock_or_recover().dragging = true;
-    }
-
-    let (mut new_x, mut new_y) = logical_drag_position(base_x, base_y, start, current);
-
-    // Query pet bounds once for both clamp and hit-window sync
-    let bounds = windows::get_pet_bounds(&app);
-    let pet_w = bounds
-        .as_ref()
-        .map(|b| b.width)
-        .unwrap_or(prefs::DEFAULT_PET_DIMENSION);
-    let pet_h = bounds
-        .as_ref()
-        .map(|b| b.height)
-        .unwrap_or(prefs::DEFAULT_PET_DIMENSION);
-    let probe_bounds = windows::WindowBounds {
-        x: new_x,
-        y: new_y,
-        width: pet_w,
-        height: pet_h,
-    };
-
-    // Clamp to screen bounds: keep at least 30 logical px of the pet visible
-    if let Some(monitor) = windows::monitor_for_bounds(&app, &probe_bounds)
-        .or_else(|| windows::current_monitor_for_pet(&app))
-    {
-        let min_visible = (30.0 * windows::pet_scale_factor(&app)).round() as i32;
-        (new_x, new_y) =
-            windows::clamp_window_to_monitor(new_x, new_y, pet_w, pet_h, &monitor, min_visible);
-    }
-
-    // All coords are physical pixels — set_position directly
-    if let Some(pet) = app.get_webview_window("pet") {
-        let _ = pet.set_position(PhysicalPosition::new(new_x, new_y));
-    }
-
-    // Construct updated bounds from the new position + known size (avoid second IPC query)
-    let updated = windows::WindowBounds {
-        x: new_x,
-        y: new_y,
-        width: pet_w,
-        height: pet_h,
-    };
-    // During drag: just reposition the hit window without emitting layout changes
-    // to the frontend. Re-rendering hit-zone divs mid-drag disrupts pointer events.
-    let profile = current_hit_profile(&app);
-    let _ = windows::sync_hit_window(&app, &updated, &profile);
-    // Emit the snap preview only when the side changes — a per-move emit is
-    // wasted frontend work.
-    let side = mini::edge_snap_for_bounds(&app, &updated).map(|snap| snap.side);
-    let side_changed = {
-        let mut d = drag.lock_or_recover();
-        if d.last_snap_side == side {
-            false
-        } else {
-            d.last_snap_side = side;
-            true
-        }
-    };
-    if side_changed {
-        emit_snap_preview(&app, side);
+fn drag_move(app: AppHandle, drag: tauri::State<SharedDrag>, drag_id: u64) {
+    if let Ok(cursor) = app.cursor_position() {
+        apply_drag_point(&app, drag.inner(), drag_id, DragPoint { x: cursor.x, y: cursor.y });
     }
 }
 
 #[tauri::command]
 fn drag_end(
-    app: AppHandle,
-    drag: tauri::State<SharedDrag>,
+    app: AppHandle, drag: tauri::State<SharedDrag>,
     abort_handle: tauri::State<'_, SleepAbortHandle>,
+    drag_id: u64, x: Option<f64>, y: Option<f64>, cancelled: bool,
 ) {
-    emit_snap_preview(&app, None);
-    let was_dragging = {
-        let mut d = drag.lock_or_recover();
-        let dragging = d.dragging;
-        d.active = false;
-        d.dragging = false;
-        dragging
+    if !drag.lock_or_recover().accepts(drag_id) { return; }
+    let release = x.zip(y).filter(|(x, y)| x.is_finite() && y.is_finite());
+    let cancelled = cancelled || release.is_none();
+    let final_bounds = if cancelled { None } else {
+        let (x, y) = release.unwrap();
+        apply_drag_point(&app, drag.inner(), drag_id, DragPoint { x, y })
     };
-
-    let is_mini = prefs::is_mini_mode(&app);
-
-    if is_mini {
-        if !was_dragging {
-            // Click in mini mode — just sync, don't change mode
-            sync_hit(&app);
-        } else if mini::should_snap_to_edge(&app).is_some() {
-            // Dragged but still near edge — stay in mini mode
-            mini::remember_snap_for_current_monitor(&app);
-            sync_hit(&app);
-        } else {
-            // Dragged away from edge — exit mini mode
-            cancel_pending_task(&abort_handle);
-            mini::do_exit_mini(&app);
+    let (was_dragging, original, snap) = {
+        let mut d = drag.lock_or_recover();
+        if !d.accepts(drag_id) { return; }
+        d.active = false;
+        let result = (d.dragging, d.start_bounds, d.snap.take());
+        d.dragging = false;
+        result
+    };
+    if cancelled {
+        if let (Some(bounds), Some(pet)) = (original, app.get_webview_window("pet")) {
+            let _ = pet.set_position(PhysicalPosition::new(bounds.x, bounds.y));
         }
-    } else if was_dragging && mini::should_snap_to_edge(&app).is_some() {
-        // Actually dragged to edge → enter mini mode (clicks won't trigger this).
-        // animate_to_x inside do_enter_mini auto-syncs hit window on completion.
-        if mini::do_enter_mini(&app) {
-            cancel_pending_task(&abort_handle);
+        sync_hit(&app);
+        return;
+    }
+    if !was_dragging {
+        sync_hit(&app);
+        return;
+    }
+    let Some(bounds) = final_bounds else { sync_hit(&app); return; };
+    if let Some(snap) = snap {
+        cancel_pending_task(&abort_handle);
+        if mini::enter_mini_at(&app, bounds, Some(snap)) {
             let app2 = app.clone();
             let handle = tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(MINI_IDLE_DELAY_MS)).await;
-                emit_state(&app2, "mini-idle", "clyde-mini-idle.svg");
+                if prefs::is_mini_mode(&app2) && !drag_in_progress(&app2) {
+                    emit_state(&app2, "mini-idle", "clyde-mini-idle.svg");
+                }
             });
             *abort_handle.lock_or_recover() = Some(handle);
         }
     } else {
-        // Normal click or drag end — sync hit window
-        sync_hit(&app);
-        if was_dragging {
-            persist_current_pet_position(&app);
+        if prefs::is_mini_mode(&app) {
+            cancel_pending_task(&abort_handle);
+            mini::exit_mini_at(&app, Some(bounds));
         }
+        sync_hit(&app);
+        persist_current_pet_position(&app);
     }
 }
 
@@ -892,12 +835,14 @@ fn show_context_menu(
 
 #[tauri::command]
 fn mini_peek_in(app: AppHandle) {
+    if drag_in_progress(&app) { return; }
     emit_state(&app, "mini-peek", "clyde-mini-peek.svg");
     mini::peek_in(&app);
 }
 
 #[tauri::command]
 fn mini_peek_out(app: AppHandle) {
+    if drag_in_progress(&app) { return; }
     emit_state(&app, "mini-idle", "clyde-mini-idle.svg");
     mini::peek_out(&app);
 }
@@ -1829,16 +1774,7 @@ fn start_cleanup_loop(app: &AppHandle, state: SharedState) {
 }
 
 pub fn run() {
-    let drag_state: SharedDrag = Arc::new(Mutex::new(DragState {
-        active: false,
-        dragging: false,
-        start_win_x: 0,
-        start_win_y: 0,
-        start_mouse_x: 0.0,
-        start_mouse_y: 0.0,
-        drag_scale_factor: 1.0,
-        last_snap_side: None,
-    }));
+    let drag_state: SharedDrag = Arc::new(Mutex::new(DragState::default()));
     let shared_state: SharedState = Arc::new(Mutex::new(StateMachine::new()));
     let pending_perms: PendingPerms = Arc::new(Mutex::new(HashMap::new()));
     let approval_queue: ApprovalQueue =
@@ -2028,41 +1964,26 @@ mod tests {
     }
 
     #[test]
-    fn test_logical_drag_position_adds_screen_delta_to_window_origin() {
-        let start = DragPoint { x: 800.0, y: 640.0 };
-        let current = DragPoint { x: 860.0, y: 712.0 };
-        assert_eq!(logical_drag_position(120, 80, start, current), (180, 152));
+    fn test_physical_drag_position_handles_negative_monitor_origin() {
+        let base = windows::WindowBounds { x: -1800, y: 200, width: 200, height: 200 };
+        assert_eq!(physical_drag_position(&base,
+            DragPoint { x: -1720.0, y: 340.0 }, DragPoint { x: 40.0, y: 420.0 }, (200, 200)), (-40, 280));
     }
 
     #[test]
-    fn test_drag_move_uses_drag_start_scale_factor_for_consistent_delta() {
-        let base = (500, 300);
-        let start_logical = DragPoint { x: 100.0, y: 100.0 };
-        let current_logical = DragPoint { x: 130.0, y: 100.0 };
+    fn test_grabbed_point_tracks_native_dpi_resize() {
+        let base = windows::WindowBounds { x: 500, y: 200, width: 200, height: 200 };
+        let start = DragPoint { x: 580.0, y: 340.0 };
+        let release = DragPoint { x: 2000.0, y: 500.0 };
+        assert_eq!(physical_drag_position(&base, start, release, (300, 300)), (1880, 290));
+    }
 
-        let start_physical = logical_to_physical(start_logical, 2.0);
-        let current_physical_with_drag_start_scale = logical_to_physical(current_logical, 2.0);
-        let current_physical_with_current_scale = logical_to_physical(current_logical, 1.0);
-
-        assert_eq!(
-            logical_drag_position(
-                base.0,
-                base.1,
-                start_physical,
-                current_physical_with_drag_start_scale,
-            ),
-            (560, 300)
-        );
-
-        // Mixed-basis conversion (using a different scale for current pointer) produces a wrong delta.
-        assert_ne!(
-            logical_drag_position(
-                base.0,
-                base.1,
-                start_physical,
-                current_physical_with_current_scale,
-            ),
-            (560, 300)
-        );
+    #[test]
+    fn test_closed_or_old_gesture_cannot_move_new_drag() {
+        let mut drag = DragState { id: 2, active: true, ..Default::default() };
+        assert!(!drag.accepts(1));
+        assert!(drag.accepts(2));
+        drag.active = false;
+        assert!(!drag.accepts(2));
     }
 }

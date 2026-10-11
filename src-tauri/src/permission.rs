@@ -327,6 +327,7 @@ fn get_work_area(app: &AppHandle) -> crate::windows::MonitorArea {
                 y: 0,
                 width,
                 height,
+                scale_factor: 1.0,
             }
         })
 }
@@ -556,6 +557,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
 
         let scale = 1.0;
@@ -572,6 +574,7 @@ mod tests {
             y: 0,
             width: 1728,
             height: 1117,
+            scale_factor: 1.0,
         };
 
         let scale = 1.0;
@@ -589,6 +592,7 @@ mod tests {
             y: 0,
             width: 3840, // 1920 logical * 2
             height: 2160,
+            scale_factor: 1.0,
         };
 
         let scale = 2.0;
@@ -607,6 +611,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let scale = 1.0;
         let x = center_bubble_x(1000, 360, &monitor, scale, 120);
@@ -621,6 +626,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let scale = 1.0;
         let x = center_bubble_x(50, 360, &monitor, scale, -10_000);
@@ -647,6 +653,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let anchor = BubbleAnchor {
             x: 1000,
@@ -692,6 +699,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let anchor = BubbleAnchor {
             x: 1000,
@@ -737,6 +745,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let anchor_above = BubbleAnchor {
             x: 1000,
@@ -805,6 +814,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_factor: 1.0,
         };
         let anchor = BubbleAnchor {
             x: 1000,
