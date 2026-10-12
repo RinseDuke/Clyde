@@ -43,6 +43,7 @@
 | ID | 任务 | 状态 | 主要文件 |
 |----|------|------|----------|
 | T5 | 移除蓝色吸附框/缩放预览；修正高 DPI 命中区域；主体边缘吸附及迟滞；拖拽收尾与动画互斥 | 已完成（待 Windows 原生实测） | hit/App.svelte、pet/App.svelte、lib.rs、mini.rs、windows.rs、tick.rs |
+| T6 | v0.1.7 版本同步、Windows release 打包及 GitHub 发布 | 进行中 | package.json、锁文件、tauri.conf.json、update_check.rs、CHANGELOG.md、release.yml |
 
 Git 留档：用户于 2026-10-11 授权提交；修复分支 `fix/edge-snap-20261011`，修复前快照 `478e4c2`，保留此前 T1–T4 的所有改动。
 
@@ -52,6 +53,16 @@ T5 验收：`npm test` 99 个 Rust + 18 个 JS 测试全部通过；Vite 生产�
 安装包：`src-tauri/target/release/bundle/nsis/Clyde on Desk_0.1.6_x64-setup.exe`（2,214,543 bytes）。
 SHA256：`73C33B17079EC7255FAB747F06A6A415BAAFCC1BD9379E6AF62A3D180F476FCE`。
 浏览器回归脚本在构建后运行：`python hooks/tests/verify-hit-ui.py`（需 Python Playwright 和 Edge；进程内临时 HTTP 服务自动关闭）。
+
+### v0.1.7 发布准备（2026-10-12）
+
+- 用户授权推送和打包发布；按现有 v0.1.6 序列升级为 v0.1.7，发布目标 `RinseDuke/Clyde`，不改动原作者仓库。
+- `package.json`、`package-lock.json`、`Cargo.toml`、`Cargo.lock`、`tauri.conf.json` 同步为 0.1.7；更新检查地址改为本 fork，CHANGELOG 和自动发布说明同步。
+- 99 个 Rust + 18 个 JS 测试通过；Vite / Tauri release / NSIS 构建成功；浏览器模拟回归四档 DPI 全通过。
+- Windows x64 安装包：`src-tauri/target/release/bundle/nsis/Clyde-on-Desk_0.1.7_windows-x64-setup.exe`，2,214,659 bytes。
+- SHA256：`c1338f5caabb823ca4136e0c13aa3ba603ffcd73a2eb0c97d8fcfe79f1a2213d`；同目录 `.exe.sha256` 文件供下载校验。
+- GitHub 上传/发布待完成；Windows 原生跨屏拖动仍待用户实测。
+- 普通 Python 3.13 未安装 Playwright，浏览器验证使用 Codex bundled Python：`C:\Users\Rinse\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`。
 
 ## 改动日志
 

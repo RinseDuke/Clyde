@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.7 — Personal Fork: Dragging & Edge Snapping Fixes
+
+### Bug Fixes
+
+- Remove the blue edge-snap outline and pet shrinking during drag previews.
+- Align hit regions with physical window geometry across display scaling levels.
+- Coalesce drag updates and serialize IPC, with reliable final cursor sampling and cancellation.
+- Snap the pet's body to the monitor work area, respecting side taskbars and using separate entry/exit thresholds to avoid flickering.
+- Preserve the dropped position when dragging out of mini mode; prevent conflicting movement and peek animations while dragging.
+- Refresh tray menu state after mini-mode and Do Not Disturb changes.
+- Hide Windows consoles when checking WSL agent sessions at startup.
+- Check for updates from `RinseDuke/Clyde` so personal fixes remain on this fork's release track.
+
+### Validation
+
+- 99 Rust tests and 18 JavaScript tests pass.
+- Browser tests with simulated Tauri IPC cover 100%, 125%, 150%, and 200% display scaling. Native Windows multi-monitor dragging still requires manual verification.
+- Windows x64 NSIS installer built with Tauri's release profile.
+
+---
+
 ## v0.1.6 — Update Check & Mini Mode Fix
 
 ### New Features

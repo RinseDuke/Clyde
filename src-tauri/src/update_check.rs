@@ -5,7 +5,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/QingJ01/Clyde/releases/latest";
+    "https://api.github.com/repos/RinseDuke/Clyde/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 4 * 60 * 60; // 4 hours
 const STARTUP_DELAY_SECS: u64 = 30;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
